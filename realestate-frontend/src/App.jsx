@@ -6,7 +6,6 @@ import {
 import { Search, Loader2, TrendingUp, DollarSign, MapPin, Layers, Target, BarChart3, Rocket, XCircle, Download } from 'lucide-react';
 
 // Base URL for the Django API. 
-// Note: This must match your Django setup (e.g., if Django is running on port 8000, use that URL)
 const API_BASE_URL = 'http://127.0.0.1:8000'; 
 const ANALYZE_URL = `${API_BASE_URL}/api/analyze/`;
 const DOWNLOAD_URL = `${API_BASE_URL}/api/download/`;
@@ -40,7 +39,8 @@ const App = () => {
     const [error, setError] = useState(null);
     const [lastSuccessfulQuery, setLastSuccessfulQuery] = useState('');
 
-    const handleAnalyze = async (e) => {
+    // Use useCallback for handleAnalyze for performance and stability
+    const handleAnalyze = useCallback(async (e) => {
         e.preventDefault(); 
         if (!query.trim()) return;
 
@@ -65,16 +65,18 @@ const App = () => {
                     throw new Error("404 Not Found. Check Django's URL configuration and the API_BASE_URL.");
                 }
 
+                // Check for server-side errors before attempting to parse JSON
+                if (!response.ok) {
+                    const errorData = await response.json(); // Attempt to read error JSON
+                    throw new Error(errorData.error || `Request failed with status ${response.status}.`);
+                }
+
                 const data = await response.json();
 
-                if (response.ok) {
-                    setAnalysisResult(data);
-                    setLastSuccessfulQuery(query);
-                    setLoading(false);
-                    return; // Success
-                } else {
-                    throw new Error(data.error || `Request failed with status ${response.status}.`);
-                }
+                setAnalysisResult(data);
+                setLastSuccessfulQuery(query);
+                setLoading(false);
+                return; // Success
             } catch (err) {
                 if (i < maxRetries - 1) {
                     await new Promise(resolve => setTimeout(resolve, delay));
@@ -86,62 +88,46 @@ const App = () => {
                 }
             }
         }
-    };
+    }, [query]); // Recreate if query changes
     
     // ====================================================================
-    // DOWNLOAD FUNCTIONALITY 
+    // DOWNLOAD FUNCTIONALITY - Wrapped in useCallback
     // ====================================================================
-    const handleDownload = async () => {
-        const tableDataLength = analysisResult?.tableData?.length || 0;
-        
-        if (!lastSuccessfulQuery || tableDataLength === 0) {
-            setError("Please run a successful query before attempting to download data.");
-            return;
+    const handleDownload = useCallback(async () => {
+    if (!analysisResult?.tableData?.length) {
+        setError("Please run an analysis before downloading.");
+        return;
+    }
+
+    try {
+        const response = await fetch(DOWNLOAD_URL, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(analysisResult.tableData),   // 🔥 FIXED
+        });
+
+        if (!response.ok) {
+            const text = await response.text();
+            throw new Error(text);
         }
+
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
         
-        try {
-            const response = await fetch(DOWNLOAD_URL, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ query: lastSuccessfulQuery }),
-            });
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "analysis_results.csv";
+        a.click();
 
-            if (!response.ok) {
-                const errorText = await response.text();
-                throw new Error(`Download request failed: ${response.status} - ${errorText}`);
-            }
+        window.URL.revokeObjectURL(url);
 
-            // Get the Blob data
-            const blob = await response.blob(); 
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            
-            let filename = 'real_estate_data.csv'; 
+    } catch (err) {
+        setError("Failed to download CSV: " + err.message);
+    }
+}, [analysisResult]);
 
-            // Attempt to get filename from Content-Disposition header
-            const contentDisposition = response.headers.get('Content-Disposition');
-            if (contentDisposition) {
-                const filenameMatch = contentDisposition.match(/filename="(.+)"/);
-                if (filenameMatch && filenameMatch.length === 2) {
-                    filename = filenameMatch[1].replace(/['"]/g, ''); 
-                }
-            }
-            
-            // Trigger the download
-            a.href = url;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            window.URL.revokeObjectURL(url); 
-            
-        } catch (err) {
-            console.error("Download failed:", err);
-            setError(`Failed to download data: ${err.message}`);
-        }
-    };
     // ====================================================================
 
 
@@ -219,7 +205,7 @@ const App = () => {
             <div className="flex justify-end mb-4">
                 <button 
                     onClick={handleDownload}
-                    disabled={tableData.length === 0}
+                    disabled={tableData.length === 0 || !lastSuccessfulQuery}
                     className={`flex items-center px-4 py-2 text-sm font-semibold rounded-lg transition duration-200 
                         ${tableData.length > 0 && lastSuccessfulQuery
                             ? 'bg-cyan-600 text-white hover:bg-cyan-500 shadow-md hover:shadow-cyan-500/50' 

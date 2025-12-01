@@ -1,11 +1,16 @@
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
+# analysis_app/views.py
 import json
+from io import StringIO
+import csv # <--- NEW IMPORT
 import pandas as pd
 from pathlib import Path
 import os
 import re
 import logging 
+
+from django.http import JsonResponse, HttpResponse # <--- Updated imports
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST # <--- NEW IMPORT
 
 logging.basicConfig(level=logging.INFO)
 
@@ -27,8 +32,8 @@ GLOBAL_DF = None
 REQUIRED_COLUMNS_MAPPING = {
     'final location': 'area', # Note: Excel column headers usually retain spaces before standardization
     'flat - weighted average rate': 'price',  # Exact match for your price column
-    'total sold - igr': 'total_sold',         # Exact match for your sales column (used for demand)
-    'total units': 'total_supply',            # Exact match for supply
+    'total sold - igr': 'total_sold',  # Exact match for your sales column (used for demand)
+    'total units': 'total_supply',  # Exact match for supply
     'residential sold - igr': 'residential_sold', 
     'total carpet area supplied (sqft)': 'size', 
     'year': 'year',
@@ -64,11 +69,6 @@ def load_and_preprocess_data():
 
     try:
         # 1. Standardize column names (to allow for easy mapping)
-        # We rename columns using the original strings in the mapping first, 
-        # as pd.read_excel preserves spaces.
-        
-        # Invert the mapping to rename (internal_name: original_excel_name)
-        # We only rename the columns we care about to their internal names.
         
         # Prepare a dictionary for renaming (Original Header -> Internal Name)
         rename_dict = {
@@ -260,7 +260,7 @@ def analyze_real_estate(query, df):
     
     return results
 
-# --- Django View (Entry Point) ---
+# --- Django View (Entry Point for Analysis) ---
 
 @csrf_exempt
 def analyze_query(request):
@@ -291,6 +291,52 @@ def analyze_query(request):
             return JsonResponse({'error': str(e)}, status=500)
     else:
         return JsonResponse({'error': 'POST required'}, status=405)
+
+# --- Django View (Entry Point for CSV Download) ---
+
+@csrf_exempt
+@require_POST
+def download_csv(request):
+    """
+    Takes the JSON data (processed table data) from the request body, 
+    converts it to a CSV file, and returns it as a downloadable attachment.
+    """
+    try:
+        # 1. Parse the JSON data sent from the frontend
+        data = json.loads(request.body)
+        
+        # We expect the data to be a list of objects (rows)
+        if not isinstance(data, list) or not data:
+            return JsonResponse({'error': 'Invalid or empty data payload.'}, status=400)
+
+        # 2. Prepare the CSV content in memory
+        output = StringIO()
+        
+        # Use csv.DictWriter since the data is a list of dictionaries
+        fieldnames = list(data[0].keys())
+        csv_writer = csv.DictWriter(output, fieldnames=fieldnames)
+        
+        # Write the header row
+        csv_writer.writeheader()
+        
+        # Write the data rows
+        csv_writer.writerows(data)
+            
+        # 3. Create the HTTP response object
+        response = HttpResponse(output.getvalue(), content_type='text/csv')
+        
+        # Set the filename and attachment header
+        response['Content-Disposition'] = 'attachment; filename="analysis_results.csv"'
+        
+        return response
+
+    except json.JSONDecodeError:
+        return JsonResponse({'error': 'Invalid JSON format in request body.'}, status=400)
+    except Exception as e:
+        # Catch any other unexpected errors
+        logging.error(f"CSV download error: {e}")
+        return JsonResponse({'error': f'An unexpected error occurred during CSV creation: {str(e)}'}, status=500)
+
 
 if GLOBAL_DF is None:
     # Attempt to load data on startup (will only log success or failure)
