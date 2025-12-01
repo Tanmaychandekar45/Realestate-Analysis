@@ -1,45 +1,172 @@
-# analysis_app/views.py
 import json
 from io import StringIO
-import csv # <--- NEW IMPORT
+import csv
 import pandas as pd
 from pathlib import Path
 import os
 import re
 import logging 
+import time 
+import requests 
+from requests.exceptions import RequestException 
 
-from django.http import JsonResponse, HttpResponse # <--- Updated imports
+from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_POST # <--- NEW IMPORT
+from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_http_methods 
 
 logging.basicConfig(level=logging.INFO)
 
 # =========================================================================
-# === CONFIGURATION ===
+# === LLM CONFIGURATION & UTILITY (Gemini API) ===
 # =========================================================================
-DATA_FILENAME = 'Sample_data.xlsx'  # <<< CHANGED TO .xlsx
+
+# --- CRITICAL FIX APPLIED HERE ---
+# 1. Get the key by its variable name 'GEMINI_API_KEY'.
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') 
+
+# 2. IMPORTANT: If the key exists, strip any surrounding whitespace and quotes (") 
+# that might have been accidentally read from the .env file.
+if GEMINI_API_KEY:
+    GEMINI_API_KEY = GEMINI_API_KEY.strip().strip('"') 
+# --- END CRITICAL FIX ---
+
+GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025" 
+# Ensure the API key is safely embedded in the URL if it exists
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY or ''}"
+
+MAX_RETRIES = 5
+
+def generate_summary_with_llama(text_to_summarize: str) -> str:
+    """
+    Calls the Gemini API to generate a professional text summary 
+    with exponential backoff for robust communication.
+    """
+    
+    if not GEMINI_API_KEY:
+        return "Error: GEMINI_API_KEY environment variable is not set or is empty. Cannot call the LLM API."
+
+    # 1. Define the conversation history (System and User messages)
+    system_prompt = "You are a senior real estate market analyst. Review the raw data report provided. Write a professional, concise, and insightful one-paragraph market summary based ONLY on the facts given. Highlight key performance indicators like price movement and sales velocity. Use clear, non-technical language appropriate for a client report."
+    user_query = f"Summarize this raw market report:\n\n{text_to_summarize}"
+    
+    messages = [
+        {
+            "role": "user",
+            "parts": [{"text": user_query}]
+        }
+    ]
+
+    # 2. Construct the API Payload
+    payload = {
+        "contents": messages,
+        "systemInstruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "generationConfig": { 
+            "temperature": 0.3, # Low temperature for accurate summarization
+            # FIX: Increased maxOutputTokens to 1024 to prevent MAX_TOKENS cutoff
+            "maxOutputTokens": 1024 
+        }
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            logging.info(f"Attempt {attempt + 1}: Calling Gemini API...")
+            
+            # 3. Make the external API Call (Key is in the URL as a query parameter)
+            response = requests.post(
+                GEMINI_API_URL,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=60
+            )
+            response.raise_for_status()
+
+            # 4. Process the LLM Response
+            result = response.json()
+            
+            # Check for potential error in API response before trying to extract text
+            if 'error' in result:
+                error_message = result['error'].get('message', 'Unknown API Error')
+                logging.error(f"Gemini API returned an error: {error_message}")
+                # Raise an HTTP error to trigger the retry/error handling
+                response.raise_for_status() 
+
+            # Extract generated text from the standard Gemini API response structure
+            candidate = result.get('candidates', [{}])[0]
+            generated_text = candidate.get('content', {}).get('parts', [{}])[0].get('text', '').strip()
+            
+            if generated_text:
+                logging.info("Gemini API successfully returned summary.")
+                return generated_text
+            
+            # Log specific reason if available
+            finish_reason = candidate.get('finishReason', 'UNKNOWN')
+            logging.error(f"Gemini returned an empty response or unexpected structure (Finish Reason: {finish_reason}): {result}")
+            
+            # If the finish reason is still MAX_TOKENS, even with the increase, provide a helpful error.
+            if finish_reason == 'MAX_TOKENS':
+                return "Error: The AI reached the maximum word count and could not complete the summary. The requested data might be too extensive for a one-paragraph summary."
+            
+            return "Error: LLM returned an empty response."
+
+        except requests.exceptions.HTTPError as http_err:
+            # Safely attempt to extract detailed error message from response body
+            error_details = "No specific error message."
+            try:
+                error_details = response.json().get('error', {}).get('message', 'No specific error message.')
+            except json.JSONDecodeError:
+                pass # Body wasn't JSON, use default error message
+                
+            logging.error(f"HTTP Error: {http_err}. Details: {error_details}")
+
+            if attempt < MAX_RETRIES - 1:
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+            else:
+                return f"Error: Failed to receive a valid response from the API after multiple retries. Details: {error_details}"
+                
+        except (RequestException, json.JSONDecodeError, IndexError, KeyError) as e:
+            logging.error(f"Attempt {attempt + 1} failed due to API/JSON error: {e}")
+            if attempt < MAX_RETRIES - 1:
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+            else:
+                return "Error: Failed to receive a valid response from the LLM API after multiple retries."
+        except Exception as e:
+            return f"An unexpected error occurred during LLM call: {e}"
+    
+    return "Error: Failed to process the request."
+
+
+# =========================================================================
+# === APPLICATION CONFIGURATION ===
+# =========================================================================
+DATA_FILENAME = 'Sample_data.xlsx'
 APP_DIR = Path(__file__).resolve().parent 
 EXCEL_FILE_PATH = APP_DIR / 'data' / DATA_FILENAME
 
 logging.info(f"Attempting to load data from: {EXCEL_FILE_PATH}") 
 
-# --- 1. Load and Pre-process Data ---
-GLOBAL_DF = None
-
 # MAPPING based on your Excel file's column headers.
-# Keys are the standardized (lowercase, stripped) names from the Excel file.
-# Values are the internal names used by the analysis logic.
 REQUIRED_COLUMNS_MAPPING = {
-    'final location': 'area', # Note: Excel column headers usually retain spaces before standardization
-    'flat - weighted average rate': 'price',  # Exact match for your price column
-    'total sold - igr': 'total_sold',  # Exact match for your sales column (used for demand)
-    'total units': 'total_supply',  # Exact match for supply
+    'final location': 'area',
+    'flat - weighted average rate': 'price',
+    'total sold - igr': 'total_sold',
+    'total units': 'total_supply',
     'residential sold - igr': 'residential_sold', 
     'total carpet area supplied (sqft)': 'size', 
     'year': 'year',
 }
 
 ANALYSIS_COLUMNS = ['year', 'area', 'price', 'demand', 'unsold_inventory', 'size']
+
+GLOBAL_DF = None
 
 def load_and_preprocess_data():
     """
@@ -101,18 +228,19 @@ def load_and_preprocess_data():
         if 'area' in df.columns:
             df['area'] = df['area'].astype(str).str.strip().str.title()
         if 'price' in df.columns:
-             df['price'] = pd.to_numeric(df['price'], errors='coerce')
+            df['price'] = pd.to_numeric(df['price'], errors='coerce')
 
         # Filter for essential columns
-        existing_cols = [col for col in ['year', 'area', 'price', 'demand'] if col in df.columns]
+        essential_cols = ['year', 'area', 'price', 'demand']
+        existing_cols = [col for col in essential_cols if col in df.columns]
         
         if len(existing_cols) < 3:
-             logging.error(f"Critical columns missing after processing. Found: {df.columns.tolist()}")
-             # List the headers found in the original file to help the user debug if necessary
-             missing_cols_msg = ", ".join([col for col in ['area', 'price', 'total_sold', 'total_supply'] if col not in df.columns])
-             if missing_cols_msg:
-                 raise ValueError(f"Required columns were not found or mapped: {missing_cols_msg}")
-             return pd.DataFrame()
+            logging.error(f"Critical columns missing after processing. Found: {df.columns.tolist()}")
+            # List the headers found in the original file to help the user debug if necessary
+            missing_cols_msg = ", ".join([col for col in essential_cols if col not in df.columns])
+            if missing_cols_msg:
+                raise ValueError(f"Required columns were not found or mapped: {missing_cols_msg}")
+            return pd.DataFrame()
 
         df = df.dropna(subset=existing_cols)
         
@@ -130,21 +258,23 @@ def parse_query_for_areas(query, available_areas):
     query_lower = query.lower()
     comparison_keywords = ['compare', 'vs', 'and', 'with'] 
     is_comparison = any(kw in query_lower for kw in comparison_keywords)
-    detected_areas = []
+    detected_areas_set = set()
     
     # Simple, non-fuzzy check for areas
-    for area in available_areas:
+    available_areas_lower_map = {area.lower(): area for area in available_areas if area is not None}
+    
+    for area_lower, area_original in available_areas_lower_map.items():
         # Check if the area name is present as a whole word (using regex word boundary \b)
-        if re.search(r'\b' + re.escape(area.lower()) + r'\b', query_lower):
-             detected_areas.append(area)
+        # This is the strict detection for explicit mentions.
+        if re.search(r'\b' + re.escape(area_lower) + r'\b', query_lower):
+            detected_areas_set.add(area_original)
 
-    if not detected_areas and len(available_areas) > 0:
-        valid_areas = [area for area in available_areas if area and area.lower() != 'nan']
-        unique_areas = list(set(valid_areas))
-        # Default: Return top 3 areas if none detected
-        detected_areas = unique_areas[:3] if len(unique_areas) >= 3 else unique_areas
+    # CRITICAL FIX: The previous default/fallback logic is removed from this function.
+    # This function now ONLY returns areas explicitly detected in the query.
+    # The decision to use a default set of areas (top 3) is moved to the calling function,
+    # ensuring that a successful single detection prevents the fallback.
         
-    return detected_areas, is_comparison
+    return list(detected_areas_set), is_comparison
 
 # --- 3. Core Analysis Function ---
 
@@ -159,21 +289,39 @@ def analyze_real_estate(query, df):
         return results
 
     available_areas = df['area'].unique().tolist()
+    
+    # 1. Attempt to find explicit area mentions
     target_areas, is_comparison = parse_query_for_areas(query, available_areas)
     
     target_areas = [area for area in target_areas if area and area.lower() != 'nan']
 
     if not target_areas:
-        results["summary"] = "Could not identify specific real estate areas in your query. Please specify an area like 'Analyze Wakad' or 'Compare Hinjawadi and Aundh'."
-        return results
+        # 2. If no area is explicitly detected (e.g., query was "Global analysis"), 
+        #    we apply the default fallback to the top 3 areas.
+        #    This block is now ONLY executed when the initial specific detection fails,
+        #    ensuring that a successful single-area query (like "analyze baner") 
+        #    does NOT fall into this default logic.
+        
+        valid_areas = [area for area in available_areas if area and area.lower() != 'nan']
+        if valid_areas and GLOBAL_DF is not None and not GLOBAL_DF.empty:
+            
+            # Use value_counts to find the top 3 most represented areas
+            area_counts = GLOBAL_DF['area'].value_counts()
+            top_areas = area_counts.index.tolist()[:3]
+            target_areas = [area for area in top_areas if area and area.lower() != 'nan']
+        
+        is_comparison = False # Treat as a single multi-area analysis (the default view)
 
     filtered_df = df[df['area'].isin(target_areas)].copy()
     
     if filtered_df.empty:
-        results["summary"] = f"No data found for the area(s): {', '.join(target_areas)}. Please check the spelling or try another area."
+        # Improved error message when target_areas is empty after all attempts (specific or default)
+        area_names = ', '.join(target_areas) if target_areas else "the queried location"
+        results["summary"] = f"No data found for {area_names}. Please check the spelling or try another area. Available areas include: {', '.join(available_areas[:5])}..."
         return results
 
     # --- Generate Chart Data ---
+    chart_data_df = pd.DataFrame()
     if all(col in filtered_df.columns for col in ['year', 'price', 'demand']):
         # Aggregate data by area and year
         chart_data_df = filtered_df.groupby(['area', 'year']).agg(
@@ -181,22 +329,20 @@ def analyze_real_estate(query, df):
             demand=('demand', 'sum') 
         ).reset_index()
         
-        # Convert to list of dictionaries for JSON, keeping area separate for comparison charts
+        # Convert to list of dictionaries for JSON, ensuring proper type conversion for JSON serialization
         chart_json = []
         for _, row in chart_data_df.iterrows():
             chart_json.append({
-                'year': row['year'],
+                'year': int(row['year']) if pd.notna(row['year']) else None,
                 'area': row['area'],
-                'price': row['price'],
-                'demand': row['demand']
+                'price': float(row['price']),
+                'demand': float(row['demand'])
             })
         
-        # If comparison, keys should include 'area' for dynamic visualization
+        # Determine the keys needed for the frontend visualization
+        chart_keys = ['year', 'price', 'demand']
         if is_comparison or len(target_areas) > 1:
-            chart_keys = ['year', 'area', 'price', 'demand']
-        else:
-            # If single area, simplify keys
-            chart_keys = ['year', 'price', 'demand']
+            chart_keys.append('area') 
             
         results["chart_data"] = {
             'data': chart_json,
@@ -211,13 +357,23 @@ def analyze_real_estate(query, df):
     
     # Create display versions of numerical columns
     if 'price' in table_df.columns:
-        table_df['price_display'] = 'Rs. ' + table_df['price'].map('{:,.0f}'.format)
+        # Use .apply(lambda x: ...) for reliable formatting across different pandas versions and dtypes
+        table_df['price_display'] = table_df['price'].apply(
+            lambda x: f'Rs. {x:,.0f}' if pd.notna(x) else 'N/A'
+        )
     if 'size' in table_df.columns:
-        table_df['size_display'] = table_df['size'].map('{:,.0f} sqft'.format)
+        table_df['size_display'] = table_df['size'].apply(
+            lambda x: f'{x:,.0f} sqft' if pd.notna(x) else 'N/A'
+        )
     if 'demand' in table_df.columns:
-        table_df['demand_display'] = table_df['demand'].astype('Int64').astype(str) + ' units sold'
+        table_df['demand_display'] = table_df['demand'].apply(
+            lambda x: f'{int(x):,} units sold' if pd.notna(x) else 'N/A'
+        )
     if 'unsold_inventory' in table_df.columns:
-        table_df['unsold_display'] = table_df['unsold_inventory'].astype('Int64').astype(str) + ' units'
+        # NOTE: Logic unchanged per user request
+        table_df['unsold_display'] = table_df['unsold_inventory'].apply(
+            lambda x: f'{int(x):,} units' if pd.notna(x) else 'N/A'
+        )
 
     final_table_columns = {
         'year': 'Year',
@@ -233,36 +389,59 @@ def analyze_real_estate(query, df):
 
     results["table_data"] = table_data
     
-    # --- Generate Summary ---
-    summary_parts = []
-    area_names = ', '.join(target_areas)
+    # --- Generate RAW Report for LLM ---
     
-    # Robust summary generation using available columns
+    raw_report_parts = []
+    
+    # Filter out empty or 'Nan' areas for the summary text
+    clean_target_areas = [area for area in target_areas if area and area.lower() != 'nan']
+    area_names = ', '.join(clean_target_areas) if clean_target_areas else "the overall market"
+    
+    raw_report_parts.append(f"MARKET ANALYSIS REPORT - Focus Areas: {area_names}")
+    raw_report_parts.append("-" * 40)
+    
+    # Global Stats for the filtered data
     if 'demand' in filtered_df.columns and 'price' in filtered_df.columns:
         total_sold = filtered_df['demand'].sum()
         avg_price = filtered_df['price'].mean()
         
-        summary_parts.append(f"**Analysis for {area_names}**:")
-        summary_parts.append(f"The market in {area_names} has recorded a total of **{total_sold:,.0f} units sold** in the filtered period.")
-        summary_parts.append(f"The average weighted price is **Rs. {avg_price:,.0f}**.")
+        raw_report_parts.append(f"Total Units Sold (Demand): {total_sold:,.0f}")
+        raw_report_parts.append(f"Overall Average Weighted Price: Rs. {avg_price:,.0f}")
         
-        if 'unsold_inventory' in filtered_df.columns and filtered_df['unsold_inventory'].sum() > 0:
-             total_unsold = filtered_df['unsold_inventory'].sum()
-             summary_parts.append(f"The total unsold inventory across the recorded period is **{total_unsold:,.0f} units**.")
-        elif 'unsold_inventory' in filtered_df.columns:
-             summary_parts.append("Inventory data suggests low or zero unsold units based on available records.")
+        if 'unsold_inventory' in filtered_df.columns:
+            total_unsold = filtered_df['unsold_inventory'].sum()
+            raw_report_parts.append(f"Total Unsold Inventory: {total_unsold:,.0f} units")
 
+        # Analyze Price Trend (Requires chart_data_df from above)
+        if not chart_data_df.empty and 'year' in chart_data_df.columns:
+            min_year = chart_data_df['year'].min()
+            max_year = chart_data_df['year'].max()
+            
+            # Calculate Y-o-Y change for the overall average price
+            if max_year > min_year:
+                # Get data for the two extremes of the time period
+                price_start = chart_data_df[chart_data_df['year'] == min_year]['price'].mean()
+                price_end = chart_data_df[chart_data_df['year'] == max_year]['price'].mean()
+                
+                if pd.notna(price_start) and pd.notna(price_end) and price_start > 0:
+                    price_change = ((price_end - price_start) / price_start) * 100
+                    raw_report_parts.append(f"Price Change from {min_year} to {max_year}: {price_change:+.2f}%")
 
+        raw_report = "\n".join(raw_report_parts)
+        
+        # --- LLM Integration: Call Gemini to summarize the RAW Report ---
+        llm_summary = generate_summary_with_llama(raw_report)
+        results["summary"] = llm_summary
+        
     else:
-        summary_parts.append(f"Basic analysis for {area_names}: Data loaded, but key metrics (price/demand) were not found in the expected columns.")
+        results["summary"] = f"Basic analysis for {area_names}: Data loaded, but key metrics (price/demand) were insufficient to generate a comprehensive report."
 
-    results["summary"] = "\n\n".join(summary_parts)
-    
     return results
 
 # --- Django View (Entry Point for Analysis) ---
 
 @csrf_exempt
+@require_http_methods(["POST"]) # Use require_http_methods for clarity
 def analyze_query(request):
     df = load_and_preprocess_data()
 
@@ -270,27 +449,27 @@ def analyze_query(request):
         error_msg = f'Failed to load data. Ensure {DATA_FILENAME} is in analysis_app/data/ and that the required columns are present: Final Location, Flat - Weighted Average Rate, Total Units, and Total Sold - IGR.'
         return JsonResponse({'error': error_msg}, status=500)
 
-    if request.method == 'POST':
-        try:
-            data = json.loads(request.body)
-            user_query = data.get('query', '').strip()
+    try:
+        data = json.loads(request.body)
+        user_query = data.get('query', '').strip()
 
-            if not user_query:
-                return JsonResponse({'error': 'No query provided.'}, status=400)
+        if not user_query:
+            # If no query, default to a global analysis (handled within analyze_real_estate)
+            user_query = "Global analysis"
+            
+        analysis_results = analyze_real_estate(user_query, df)
 
-            analysis_results = analyze_real_estate(user_query, df)
+        # Ensure the response structure is correct for the frontend
+        return JsonResponse({
+            'summary': analysis_results.get('summary', 'No summary generated.'),
+            'chartData': analysis_results.get('chart_data', {'data': [], 'keys': []}),
+            'tableData': analysis_results.get('table_data', []),
+        }, status=200)
 
-            return JsonResponse({
-                'summary': analysis_results['summary'],
-                'chartData': analysis_results['chart_data'],
-                'tableData': analysis_results['table_data'],
-            }, status=200)
+    except Exception as e:
+        logging.exception("Unexpected backend error")
+        return JsonResponse({'error': f'Backend crashed: {str(e)}'}, status=500)
 
-        except Exception as e:
-            logging.error(f"Analysis error: {e}")
-            return JsonResponse({'error': str(e)}, status=500)
-    else:
-        return JsonResponse({'error': 'POST required'}, status=405)
 
 # --- Django View (Entry Point for CSV Download) ---
 
@@ -319,7 +498,6 @@ def download_csv(request):
         # Write the header row
         csv_writer.writeheader()
         
-        # Write the data rows
         csv_writer.writerows(data)
             
         # 3. Create the HTTP response object
@@ -331,7 +509,7 @@ def download_csv(request):
         return response
 
     except json.JSONDecodeError:
-        return JsonResponse({'error': 'Invalid JSON format in request body.'}, status=400)
+        return JsonResponse({'error': 'Invalid JSON format in request body for CSV download.'}, status=400)
     except Exception as e:
         # Catch any other unexpected errors
         logging.error(f"CSV download error: {e}")
@@ -340,4 +518,5 @@ def download_csv(request):
 
 if GLOBAL_DF is None:
     # Attempt to load data on startup (will only log success or failure)
+    # The view functions will handle the case where it fails.
     load_and_preprocess_data()

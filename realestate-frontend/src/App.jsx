@@ -1,24 +1,28 @@
 import React, { useState, useCallback } from 'react';
-// Using fetch directly with exponential backoff is preferred for robustness over axios
 import {
     LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
 } from 'recharts';
 import { Search, Loader2, TrendingUp, DollarSign, MapPin, Layers, Target, BarChart3, Rocket, XCircle, Download } from 'lucide-react';
 
 // Base URL for the Django API. 
-const API_BASE_URL = 'http://127.0.0.1:8000'; 
+const API_BASE_URL = "http://127.0.0.1:8000";
+
 const ANALYZE_URL = `${API_BASE_URL}/api/analyze/`;
 const DOWNLOAD_URL = `${API_BASE_URL}/api/download/`;
 
+
+
 // --- Utility Components ---
 
-const MetricDisplay = ({ icon: Icon, title, value, colorClass, borderColorClass }) => (
+// Updated MetricDisplay to accept an optional valueClass for custom font sizing
+const MetricDisplay = ({ icon: Icon, title, value, colorClass, borderColorClass, valueClass = "text-3xl" }) => (
     <div className={`p-4 bg-gray-900 rounded-lg shadow-xl border ${borderColorClass} transition duration-300 hover:shadow-cyan-500/30 hover:scale-[1.02] transform`}>
         <div className={`flex items-center justify-between mb-2`}>
             <p className="text-sm font-mono uppercase text-gray-400">{title}</p>
             <Icon className={`w-6 h-6 ${colorClass}`} />
         </div>
-        <p className="text-3xl font-extrabold text-white overflow-hidden text-ellipsis whitespace-nowrap">{value}</p>
+        {/* Use valueClass for dynamic size */}
+        <p className={`${valueClass} font-extrabold text-white overflow-hidden text-ellipsis whitespace-nowrap`}>{value}</p>
     </div>
 );
 
@@ -31,6 +35,32 @@ const LoadingConsole = () => (
 );
 
 // --- Main Application Logic ---
+
+// Helper function to clean the raw query string for display as just the location name
+// This is still needed for the Summary header
+const cleanQueryForDisplay = (q) => {
+    // List of common prefixes to strip (case-insensitive)
+    const prefixes = [
+        "[SYSTEM_QUERY] > INITIATE ANALYSIS ON:", 
+        "INITIATE ANALYSIS ON:", 
+        "ANALYSIS ON:", 
+        "ANALYZE:"
+    ];
+    let cleaned = q.toUpperCase().trim();
+    
+    for (const prefix of prefixes) {
+        if (cleaned.startsWith(prefix)) {
+            cleaned = cleaned.substring(prefix.length).trim();
+            break;
+        }
+    }
+    // Remove quotes/apostrophes that might surround the location name
+    cleaned = cleaned.replace(/['"]/g, '').trim();
+    
+    // Fallback: If it's still long (e.g., a full sentence), just return the original uppercase query.
+    return cleaned.length > 50 ? q.toUpperCase() : cleaned;
+};
+
 
 const App = () => {
     const [query, setQuery] = useState('');
@@ -48,6 +78,9 @@ const App = () => {
         setError(null);
         setAnalysisResult(null);
 
+        // --- NEW: Clean the query for display immediately before analysis ---
+        const displayQuery = cleanQueryForDisplay(query);
+        
         const maxRetries = 3;
         let delay = 1000; 
         
@@ -67,14 +100,15 @@ const App = () => {
 
                 // Check for server-side errors before attempting to parse JSON
                 if (!response.ok) {
-                    const errorData = await response.json(); // Attempt to read error JSON
+                    const errorData = await response.json().catch(() => ({ error: 'Unknown server error.' }));
                     throw new Error(errorData.error || `Request failed with status ${response.status}.`);
                 }
 
                 const data = await response.json();
 
                 setAnalysisResult(data);
-                setLastSuccessfulQuery(query);
+                // --- UPDATED: Use the cleaned query for display ---
+                setLastSuccessfulQuery(displayQuery); 
                 setLoading(false);
                 return; // Success
             } catch (err) {
@@ -94,41 +128,41 @@ const App = () => {
     // DOWNLOAD FUNCTIONALITY - Wrapped in useCallback
     // ====================================================================
     const handleDownload = useCallback(async () => {
-    if (!analysisResult?.tableData?.length) {
-        setError("Please run an analysis before downloading.");
+    if (!analysisResult?.tableData || analysisResult.tableData.length === 0) {
+        setError("Please run analysis before downloading.");
         return;
     }
 
     try {
         const response = await fetch(DOWNLOAD_URL, {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify(analysisResult.tableData),   // 🔥 FIXED
+            headers: { "Content-Type": "application/json" },
+            // Send the raw table data for the backend to convert to CSV
+            body: JSON.stringify(analysisResult.tableData), 
         });
 
         if (!response.ok) {
-            const text = await response.text();
-            throw new Error(text);
+            const errorText = await response.text();
+            throw new Error(`Download request failed: ${errorText}`);
         }
 
-        const blob = await response.blob();
+        // The backend should return the file as a blob
+        const blob = await response.blob(); 
         const url = window.URL.createObjectURL(blob);
-        
+
         const a = document.createElement("a");
         a.href = url;
-        a.download = "analysis_results.csv";
+        a.download = `analysis_results_${lastSuccessfulQuery.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${new Date().toISOString().slice(0, 10)}.csv`;
+        document.body.appendChild(a); // Append to body to make it clickable in all browsers
         a.click();
+        document.body.removeChild(a);
 
         window.URL.revokeObjectURL(url);
 
     } catch (err) {
         setError("Failed to download CSV: " + err.message);
     }
-}, [analysisResult]);
-
-    // ====================================================================
+}, [analysisResult, lastSuccessfulQuery]);
 
 
     const chartData = analysisResult?.chartData?.data || [];
@@ -146,9 +180,21 @@ const App = () => {
         ? chartData[chartData.length - 1]['demand']
         : null;
         
+    // New: Price Growth Calculation (Simulated YOY using first and last chart data point)
+    const priceGrowth = chartData.length >= 2 
+        ? ((chartData[chartData.length - 1]['price'] - chartData[0]['price']) / chartData[0]['price']) * 100
+        : null;
+
     // Formatters
     const getFormattedPrice = (price) => (price !== null && !isNaN(price)) ? `₹${price.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ",")}` : 'N/A';
     const getFormattedDemand = (demand) => (demand !== null && !isNaN(demand)) ? `${demand.toFixed(0)} units` : 'N/A';
+    
+    const getFormattedPriceGrowth = (growth) => {
+        if (growth === null || isNaN(growth)) return 'N/A';
+        const sign = growth >= 0 ? '+' : '';
+        return `${sign}${growth.toFixed(2)}%`;
+    };
+    
     // Format chart price ticks to be cleaner (e.g., '₹50k')
     const getFormattedChartPrice = (price) => `₹${(price / 1000).toFixed(0)}k`;
 
@@ -157,13 +203,12 @@ const App = () => {
         <div className="p-6 bg-gray-900 rounded-xl shadow-2xl border border-indigo-500/50">
             <h3 className="text-xl font-bold text-indigo-400 mb-4 flex items-center">
                 <TrendingUp className="w-5 h-5 mr-2 text-lime-400" />
-                Quantum Price & Demand Projection
+                Quantum Price & Demand Projection (Time Series Depth: {chartData.length.toLocaleString()})
             </h3>
             {chartData.length > 0 ? (
                 <ResponsiveContainer width="100%" height={400}>
                     <LineChart data={chartData} margin={{ top: 15, right: 30, left: 10, bottom: 5 }}>
                         <CartesianGrid strokeDasharray="5 5" stroke="#374151" />
-                        {/* dataKey fixed to lowercase 'year' */}
                         <XAxis dataKey="year" tickLine={false} axisLine={{ stroke: '#4b5563' }} stroke="#9ca3af" /> 
                         <YAxis yAxisId="left" stroke="#3b82f6" tickFormatter={getFormattedChartPrice} tick={{ fill: '#93c5fd' }} /> 
                         <YAxis yAxisId="right" orientation="right" stroke="#10b981" tick={{ fill: '#34d399' }} /> 
@@ -171,7 +216,6 @@ const App = () => {
                             contentStyle={{ borderRadius: '8px', border: '1px solid #1f2937', backgroundColor: '#1f2937', padding: '10px' }}
                             labelStyle={{ color: '#fff' }}
                             formatter={(value, name, props) => {
-                                // Determine the key based on the dataKey
                                 const key = props.dataKey === 'price' ? 'Average Price' : 'Average Demand';
                                 const formattedValue = props.dataKey === 'price' 
                                     ? getFormattedPrice(value) 
@@ -181,7 +225,6 @@ const App = () => {
                             labelFormatter={(label) => `Year: ${label}`}
                         />
                         <Legend wrapperStyle={{ paddingTop: '15px', color: '#fff' }} />
-                        {/* dataKey fixed to lowercase 'price' and 'demand' */}
                         <Line yAxisId="left" type="monotone" dataKey="price" name="Average Price (₹/sqft)" stroke="#3b82f6" strokeWidth={3} dot={{ r: 4, fill: '#3b82f6' }} activeDot={{ r: 8, stroke: '#3b82f6', strokeWidth: 2 }} />
                         <Line yAxisId="right" type="monotone" dataKey="demand" name="Average Demand (Units Sold)" stroke="#10b981" strokeWidth={3} dot={{ r: 4, fill: '#10b981' }} activeDot={{ r: 8, stroke: '#10b981', strokeWidth: 2 }} />
                     </LineChart>
@@ -297,24 +340,33 @@ const App = () => {
                 
                 {loading && <LoadingConsole />}
                 
-                {!loading && analysisResult && (
+                {!loading && (analysisResult || lastSuccessfulQuery) && (
                     <>
-                        {/* Statistics Row */}
+                        {/* Statistics Row 
+                            - Removed 'ANALYSIS FOCUS' box.
+                            - Adjusted grid layout from grid-cols-5 to grid-cols-4 
+                        */}
                         <div className="grid grid-cols-2 lg:grid-cols-4 gap-6">
+                            
+                            {/* 1. PROPERTIES ANALYZED (Previously #2) */}
                             <MetricDisplay 
-                                icon={MapPin} 
-                                title="TARGET REGION RECORDS" 
+                                icon={Layers} 
+                                title="PROPERTIES ANALYZED" 
                                 value={totalProperties.toLocaleString()} 
-                                colorClass="text-indigo-400" 
-                                borderColorClass="border-indigo-500/50"
+                                colorClass="text-red-400" 
+                                borderColorClass="border-red-500/50"
                             />
-                                <MetricDisplay 
+                            
+                            {/* 2. AVERAGE INDEX PRICE (Previously #3) */}
+                            <MetricDisplay 
                                 icon={DollarSign} 
                                 title="AVERAGE INDEX PRICE" 
                                 value={getFormattedPrice(avgPrice)} 
                                 colorClass="text-lime-400" 
                                 borderColorClass="border-lime-500/50"
                             />
+                            
+                            {/* 3. CURRENT DEMAND RATING (Previously #4) */}
                             <MetricDisplay 
                                 icon={Target} 
                                 title="CURRENT DEMAND RATING" 
@@ -322,20 +374,23 @@ const App = () => {
                                 colorClass="text-yellow-400" 
                                 borderColorClass="border-yellow-500/50"
                             />
+                            
+                            {/* 4. YOY PRICE GROWTH (Previously #5) */}
                             <MetricDisplay 
                                 icon={TrendingUp} 
-                                title="TIME SERIES DEPTH (CYCLES)" 
-                                value={chartData.length.toLocaleString()} 
-                                colorClass="text-red-400" 
-                                borderColorClass="border-red-500/50"
+                                title="YOY PRICE GROWTH" 
+                                value={getFormattedPriceGrowth(priceGrowth)} 
+                                colorClass={priceGrowth > 0 ? "text-green-400" : priceGrowth < 0 ? "text-red-400" : "text-gray-400"} 
+                                borderColorClass={priceGrowth > 0 ? "border-green-500/50" : priceGrowth < 0 ? "border-red-500/50" : "border-gray-500/50"}
                             />
+                            
                         </div>
 
-                        {/* Summary - The Mission Report */}
+                        {/* Summary - Still uses lastSuccessfulQuery in the header */}
                         <div className="p-6 bg-gray-900 rounded-xl shadow-2xl border border-cyan-500/50">
                             <h2 className="text-xl font-bold text-cyan-400 mb-3 flex items-center">
                                 <Rocket className="w-5 h-5 mr-2 text-cyan-400"/>
-                                MISSION REPORT: ANALYSIS VERDICT
+                                MISSION REPORT: ANALYSIS VERDICT FOR {lastSuccessfulQuery || 'REGION'}
                             </h2>
                             <p className="text-gray-300 leading-relaxed font-sans">{summaryText}</p>
                         </div>
