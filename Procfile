@@ -1,1 +1,1 @@
-web: sh render_deploy.shgit
+web: cd django-backend && gunicorn SigmavalueChatbot.wsgi:application

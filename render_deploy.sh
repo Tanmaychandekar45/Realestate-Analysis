@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Exit immediately if a command exits with a non-zero status.
-set -e
+set -o errexit
 
-# 1. Apply database migrations
-echo "Running collectstatic..."
-python manage.py collectstatic --noinput
+# Change directory to the Django project root before running manage.py
+cd django-backend
 
-# 2. Start the Gunicorn server
-# Note: We explicitly set the PYTHONPATH to the current directory (.), 
-# ensuring Python can find the 'django_backend' module.
-echo "Starting Gunicorn server..."
-exec gunicorn django_backend.wsgi:application --bind 0.0.0.0:$PORT  
+# 1. Run database migrations
+echo "Running database migrations..."
+python manage.py makemigrations 
+python manage.py migrate --noinput
+
+# 2. Collect static files for production serving
+echo "Collecting static files..."
+python manage.py collectstatic --noinput --clear
+
+echo "Deployment script finished successfully."
